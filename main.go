@@ -6,12 +6,15 @@ import (
 
 	"github.com/IsaacDSC/broker/broker"
 	"github.com/IsaacDSC/broker/pub"
-	"github.com/IsaacDSC/broker/sub"
+	sub "github.com/IsaacDSC/broker/sub"
 	"github.com/google/uuid"
 )
 
 func main() {
-	client := broker.NewClient("app-name")
+	client := broker.NewClient(broker.Config{
+		Addr:    "localhost:6379",
+		AppName: "app-name",
+	})
 	go SetupConsumer("instance1", client)
 	go SetupConsumer("instance2", client)
 	SetupProducer(client)
@@ -40,7 +43,7 @@ func SetupProducer(client *broker.Client) {
 }
 
 func SetupConsumer(instancePrefix string, client *broker.Client) {
-	broker := sub.NewBroker(client).
+	broker := sub.NewSubscribe(client).
 		WithSubscriber(
 			"event1", func(subctx sub.Ctx) error {
 				fmt.Println(instancePrefix, "Handling event1", subctx.GetPayload())

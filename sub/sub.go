@@ -14,7 +14,7 @@ const (
 	MaxConcurrency = 10
 )
 
-type Broker struct {
+type Subscribe struct {
 	*broker.Client
 	subID        uuid.UUID
 	subscribers  map[string]Subscriber
@@ -23,14 +23,19 @@ type Broker struct {
 	processingWg sync.WaitGroup
 }
 
-func NewBroker(conn *broker.Client) *Broker {
-	return &Broker{
+func NewSubscribe(conn *broker.Client) *Subscribe {
+	sub := &Subscribe{
 		Client:      conn,
 		subID:       uuid.New(),
 		subscribers: make(map[string]Subscriber),
 		semaphore:   make(chan struct{}, MaxConcurrency),
 		stopCh:      make(chan struct{}),
 	}
+
+	// Registra este subscriber no balancer
+	conn.Balancer.Subscribe(sub.subID)
+
+	return sub
 }
 
 type Ctx struct {
@@ -49,7 +54,7 @@ type Subscriber struct {
 	Handler SubscriberHandler
 }
 
-func (b *Broker) WithSubscriber(eventName string, handler SubscriberHandler) *Broker {
+func (b *Subscribe) WithSubscriber(eventName string, handler SubscriberHandler) *Subscribe {
 	key := b.EventBrokerKey(eventName)
 	b.subscribers[key] = Subscriber{
 		Event:   eventName,
@@ -58,16 +63,18 @@ func (b *Broker) WithSubscriber(eventName string, handler SubscriberHandler) *Br
 	return b
 }
 
-func (b *Broker) processMessage(eventName string, msg any) {
+func (b *Subscribe) processMessage(messageID, eventName string, msg any) {
 	defer func() {
 		<-b.semaphore // libera o slot do semáforo
 		b.processingWg.Done()
+
+		// Marca a mensagem como processada após o processamento
+		b.Queue.MarkAsProcessed(messageID)
 	}()
 
 	subscriber, ok := b.subscribers[b.EventBrokerKey(eventName)]
 	if !ok {
 		log.Println("[*] Not subscriber on event: ", eventName)
-		b.Queue.Delete(eventName)
 		return
 	}
 
@@ -77,7 +84,7 @@ func (b *Broker) processMessage(eventName string, msg any) {
 	}
 }
 
-func (b *Broker) Listener() error {
+func (b *Subscribe) Listener() error {
 	if b.subscribers == nil {
 		return errors.New("subscribers map is nil")
 	}
@@ -89,31 +96,76 @@ func (b *Broker) Listener() error {
 	for {
 		select {
 		case <-b.stopCh:
+			// Desregistra do balancer antes de parar
+			b.Balancer.Unsubscribe(b.subID)
 			// Aguarda todas as goroutines terminarem antes de parar
 			b.processingWg.Wait()
 			return nil
 		default:
-			// Processa mensagens da fila
-			b.Queue.Range(func(eventName string, msg any) bool {
-				select {
-				case b.semaphore <- struct{}{}: // tenta adquirir slot do semáforo
-					// Remove a mensagem da fila imediatamente após adquirir o semáforo
-					b.Queue.Delete(eventName)
-
-					b.processingWg.Add(1)
-					go b.processMessage(eventName, msg)
-
-					return true // continua iterando
-				default:
-					// Se não conseguir adquirir o semáforo, para a iteração
-					// e tenta novamente no próximo ciclo do loop principal
-					return false
-				}
-			})
+			// Processa mensagens da fila usando o novo sistema
+			b.processAvailableMessages()
 		}
 	}
 }
 
-func (b *Broker) Stop() {
+func (b *Subscribe) processAvailableMessages() {
+	// Para cada tipo de evento que este subscriber está inscrito
+	for eventKey := range b.subscribers {
+		// Extrai o nome do evento da chave
+		eventName := b.extractEventName(eventKey)
+
+		// Busca mensagens não reivindicadas para este evento
+		messages := b.Queue.GetUnclaimedMessagesByKey(eventName)
+
+		for _, msg := range messages {
+			// Verifica se este subscriber deve processar esta mensagem
+			if !b.Balancer.ClaimMessage(b.subID, msg.ID) {
+				continue
+			}
+
+			// Verifica se a mensagem já foi processada
+			if b.Queue.IsProcessed(msg.ID) {
+				continue
+			}
+
+			// Tenta reivindicar a mensagem atomicamente
+			if !b.Queue.ClaimMessage(msg.ID) {
+				continue
+			}
+
+			select {
+			case b.semaphore <- struct{}{}: // tenta adquirir slot do semáforo
+				b.processingWg.Add(1)
+				go b.processMessage(msg.ID, eventName, msg.Value)
+			default:
+				// Se não conseguir adquirir o semáforo, libera a reivindicação
+				// e tenta novamente no próximo ciclo
+				continue
+			}
+		}
+	}
+}
+
+// Extrai o nome do evento da chave do broker
+func (b *Subscribe) extractEventName(eventKey string) string {
+	// Remove o prefixo do broker (formato: "gqueue:app-name:event")
+	parts := []rune(eventKey)
+	lastColon := -1
+
+	for i := len(parts) - 1; i >= 0; i-- {
+		if parts[i] == ':' {
+			lastColon = i
+			break
+		}
+	}
+
+	if lastColon != -1 && lastColon < len(parts)-1 {
+		return string(parts[lastColon+1:])
+	}
+
+	return eventKey
+}
+
+func (b *Subscribe) Stop() {
 	close(b.stopCh)
 }
