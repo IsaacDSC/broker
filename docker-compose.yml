@@ -1,0 +1,199 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: broker_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - broker_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: broker_redis_ui
+    hostname: redis-commander
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  broker-app-memory:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: broker_app_memory
+    environment:
+      - BROKER_MODE=memory
+      - APP_NAME=memory-app
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  broker-app-redis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: broker_app_redis
+    environment:
+      - BROKER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=redis-app
+      - QUEUE_TYPE=redis
+      - BALANCER_TYPE=redis
+      - BALANCE_STRATEGY=consistent_hash
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  broker-app-hybrid:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: broker_app_hybrid
+    environment:
+      - BROKER_MODE=hybrid
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=hybrid-app
+      - QUEUE_TYPE=redis
+      - BALANCER_TYPE=memory
+      - BALANCE_STRATEGY=weighted
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Múltiplas instâncias para testar balanceamento
+  broker-instance-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: broker_instance_1
+    environment:
+      - BROKER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=multi-instance-app
+      - INSTANCE_NAME=instance-1
+      - QUEUE_TYPE=redis
+      - BALANCER_TYPE=redis
+      - BALANCE_STRATEGY=round_robin
+      - SUBSCRIBER_WEIGHT=1
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  broker-instance-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: broker_instance_2
+    environment:
+      - BROKER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=multi-instance-app
+      - INSTANCE_NAME=instance-2
+      - QUEUE_TYPE=redis
+      - BALANCER_TYPE=redis
+      - BALANCE_STRATEGY=round_robin
+      - SUBSCRIBER_WEIGHT=2
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  broker-instance-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: broker_instance_3
+    environment:
+      - BROKER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=multi-instance-app
+      - INSTANCE_NAME=instance-3
+      - QUEUE_TYPE=redis
+      - BALANCER_TYPE=redis
+      - BALANCE_STRATEGY=round_robin
+      - SUBSCRIBER_WEIGHT=1
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Producer para enviar mensagens
+  broker-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    container_name: broker_producer
+    environment:
+      - BROKER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=multi-instance-app
+      - QUEUE_TYPE=redis
+      - BALANCER_TYPE=redis
+      - MESSAGE_COUNT=50
+      - MESSAGE_INTERVAL=200ms
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+      broker-instance-1:
+        condition: service_started
+      broker-instance-2:
+        condition: service_started
+      broker-instance-3:
+        condition: service_started
+
+  # Monitor para acompanhar estatísticas
+  broker-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.monitor
+    container_name: broker_monitor
+    environment:
+      - BROKER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - APP_NAME=multi-instance-app
+      - MONITOR_INTERVAL=5s
+    networks:
+      - broker_network
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  broker_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
