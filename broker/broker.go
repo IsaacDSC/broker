@@ -12,7 +12,7 @@ type Client struct {
 	ID      uuid.UUID
 	appName string
 
-	Queue    *queue.QueueBase
+	Queue    queue.Queuer
 	Balancer *load.Balancer
 }
 
@@ -22,6 +22,16 @@ type Config struct {
 }
 
 func NewClient(cfg Config) *Client {
+	client := &Client{
+		ID:       uuid.New(),
+		appName:  cfg.AppName,
+		Queue:    queue.NewQueueBase(),
+		Balancer: load.NewBalancer(cfg.AppName),
+	}
+	return client
+}
+
+func NewRdbClient(cfg RedisConfig) *Client {
 	client := &Client{
 		ID:       uuid.New(),
 		appName:  cfg.AppName,
