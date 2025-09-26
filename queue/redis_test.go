@@ -1,435 +1,527 @@
-package queue_test
+package queue
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/IsaacDSC/broker/queue"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/testcontainers/testcontainers-go"
+	rediscontainer "github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
-// setupRedisTest creates a Redis client for testing
-func setupRedisTest(t *testing.T) (*redis.Client, func()) {
-	// Use Redis database 15 for testing to avoid conflicts
-	client := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       15,
-	})
+// setupRedisContainer creates a Redis testcontainer and returns the client
+func setupRedisContainer(t *testing.T) (client *redis.Client, cleanup func()) {
+	// First try to connect to local Redis instance
+	if localClient := tryLocalRedis(t); localClient != nil {
+		return localClient, func() { localClient.Close() }
+	}
+
+	// Fallback to testcontainer
+	defer func() {
+		if r := recover(); r != nil {
+			t.Skipf("Docker panic recovered: %v", r)
+			client = nil
+			cleanup = func() {}
+		}
+	}()
 
 	ctx := context.Background()
 
-	// Test connection
-	_, err := client.Ping(ctx).Result()
+	// Try to start Redis container with better error handling
+	redisContainer, err := rediscontainer.RunContainer(ctx,
+		testcontainers.WithImage("redis:7-alpine"),
+	)
 	if err != nil {
-		t.Skipf("Redis not available: %v", err)
+		t.Skipf("Docker not available or failed to start Redis container: %v", err)
+		return nil, func() {}
 	}
 
-	// Clean up function
-	cleanup := func() {
-		client.FlushDB(ctx)
+	endpoint, err := redisContainer.Endpoint(ctx, "")
+	if err != nil {
+		redisContainer.Terminate(ctx)
+		t.Skipf("failed to get Redis endpoint: %v", err)
+		return nil, func() {}
+	}
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: endpoint,
+	})
+
+	// Test connection with timeout
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	_, err = redisClient.Ping(ctx).Result()
+	if err != nil {
+		redisClient.Close()
+		redisContainer.Terminate(context.Background())
+		t.Skipf("failed to connect to Redis: %v", err)
+		return nil, func() {}
+	}
+
+	cleanup = func() {
+		redisClient.Close()
+		redisContainer.Terminate(context.Background())
+	}
+
+	return redisClient, cleanup
+}
+
+// tryLocalRedis attempts to connect to a local Redis instance
+func tryLocalRedis(t *testing.T) *redis.Client {
+	localAddresses := []string{
+		"localhost:6379",
+		"localhost:6380",
+		"127.0.0.1:6379",
+		"127.0.0.1:6380",
+		"redis:6379",
+	}
+
+	for _, addr := range localAddresses {
+		client := redis.NewClient(&redis.Options{
+			Addr: addr,
+			DB:   1, // Use test database
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := client.Ping(ctx).Result()
+		cancel()
+
+		if err == nil {
+			t.Logf("Using local Redis instance at %s", addr)
+			// Clean the test database
+			client.FlushDB(context.Background())
+			return client
+		}
 		client.Close()
 	}
 
-	// Clear the test database
-	client.FlushDB(ctx)
-
-	return client, cleanup
+	return nil
 }
 
-// TestRedisQueue_basicUsage tests basic Redis queue operations
-func TestRedisQueue_basicUsage(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
+func TestRedisQueueSetQueue(t *testing.T) {
+	redisClient, cleanup := setupRedisContainer(t)
+	if redisClient == nil {
+		return // Skip if Docker is not available
+	}
 	defer cleanup()
 
-	// Create Redis queue
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Store some messages
-	queuer.Store("user.created", map[string]any{
-		"id":    "123",
-		"name":  "John Doe",
-		"email": "john@example.com",
-	})
-
-	queuer.Store("user.updated", map[string]any{
-		"id":    "456",
-		"name":  "Jane Smith",
-		"email": "jane@example.com",
-	})
-
-	queuer.Store("user.created", map[string]any{
-		"id":    "789",
-		"name":  "Bob Johnson",
-		"email": "bob@example.com",
-	})
-
-	// Check queue length
-	if queuer.Len() != 3 {
-		t.Errorf("Expected queue length 3, got %d", queuer.Len())
+	tests := []struct {
+		name        string
+		eventName   string
+		ctx         context.Context
+		wantErr     bool
+		description string
+		setup       func(t *testing.T, client *redis.Client)                   // Optional setup before test
+		verify      func(t *testing.T, client *redis.Client, eventName string) // Optional verification after test
+	}{
+		{
+			name:        "successful_set_queue_with_simple_event_name",
+			eventName:   "user.created",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should successfully set queue with simple event name",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				// Verify the key was created with the correct value
+				expectedKey := "gqueue:user.created"
+				members, err := client.SMembers(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to verify key existence: %v", err)
+					return
+				}
+				if len(members) != 1 || members[0] != "value" {
+					t.Errorf("Expected members [value], got %v", members)
+				}
+			},
+		},
+		{
+			name:        "successful_set_queue_with_complex_event_name",
+			eventName:   "order.payment.processed",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should successfully set queue with complex event name containing dots",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:order.payment.processed"
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
+		{
+			name:        "successful_set_queue_with_empty_event_name",
+			eventName:   "",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle empty event name gracefully",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:"
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
+		{
+			name:        "successful_set_queue_with_special_characters",
+			eventName:   "event-name_with@special#chars",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle event names with special characters",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:event-name_with@special#chars"
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
+		{
+			name:        "successful_set_queue_with_unicode_characters",
+			eventName:   "事件名称",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle unicode characters in event names",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:事件名称"
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
+		{
+			name:        "successful_set_queue_multiple_calls_same_event",
+			eventName:   "duplicate.event",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle multiple calls with same event name (Redis set behavior)",
+			setup: func(t *testing.T, client *redis.Client) {
+				// Pre-add the same key to test set behavior
+				redisQueue := NewRedis(client)
+				err := redisQueue.SetQueue(context.Background(), "duplicate.event")
+				if err != nil {
+					t.Fatalf("Setup failed: %v", err)
+				}
+			},
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:duplicate.event"
+				members, err := client.SMembers(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to verify key existence: %v", err)
+					return
+				}
+				// Should still have only one member due to Redis set behavior
+				if len(members) != 1 || members[0] != "value" {
+					t.Errorf("Expected exactly one member [value], got %v", members)
+				}
+			},
+		},
+		{
+			name:      "context_with_timeout",
+			eventName: "timeout.event",
+			ctx: func() context.Context {
+				ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+				return ctx
+			}(),
+			wantErr:     false,
+			description: "Should handle context with timeout successfully",
+		},
+		{
+			name:      "context_already_canceled",
+			eventName: "canceled.event",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			}(),
+			wantErr:     true,
+			description: "Should return error when context is already canceled",
+		},
+		{
+			name:        "very_long_event_name",
+			eventName:   "very.long.event.name.that.might.test.key.size.limits.in.redis.with.many.segments.and.dots.to.see.how.it.behaves.with.extremely.long.keys.that.could.potentially.cause.issues.but.should.still.work.fine.in.most.cases",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle very long event names",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := fmt.Sprintf("gqueue:%s", eventName)
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
+		{
+			name:        "event_name_with_colons",
+			eventName:   "namespace:service:event",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle event names with colons (same separator as used internally)",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:namespace:service:event"
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
+		{
+			name:        "event_name_with_spaces",
+			eventName:   "event with spaces",
+			ctx:         context.Background(),
+			wantErr:     false,
+			description: "Should handle event names with spaces",
+			verify: func(t *testing.T, client *redis.Client, eventName string) {
+				expectedKey := "gqueue:event with spaces"
+				exists, err := client.Exists(context.Background(), expectedKey).Result()
+				if err != nil {
+					t.Errorf("Failed to check key existence: %v", err)
+					return
+				}
+				if exists != 1 {
+					t.Errorf("Expected key to exist, but it doesn't")
+				}
+			},
+		},
 	}
 
-	// Load a specific message by key
-	if value, found := queuer.Load("user.updated"); found {
-		userMap, ok := value.(map[string]any)
-		if !ok {
-			t.Errorf("Expected map[string]any, got %T", value)
-		} else if userMap["name"] != "Jane Smith" {
-			t.Errorf("Expected Jane Smith, got %v", userMap["name"])
-		}
-	} else {
-		t.Error("Expected to find user.updated message")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Clean up Redis before each test
+			redisClient.FlushDB(context.Background())
 
-	// Iterate over all unclaimed messages and count them
-	messageCount := 0
-	userCreatedCount := 0
-	userUpdatedCount := 0
-
-	queuer.Range(func(key string, value any) bool {
-		messageCount++
-		if key == "user.created" {
-			userCreatedCount++
-		} else if key == "user.updated" {
-			userUpdatedCount++
-		}
-		return true // continue iteration
-	})
-
-	if messageCount != 3 {
-		t.Errorf("Expected 3 messages in range, got %d", messageCount)
-	}
-	if userCreatedCount != 2 {
-		t.Errorf("Expected 2 user.created messages, got %d", userCreatedCount)
-	}
-	if userUpdatedCount != 1 {
-		t.Errorf("Expected 1 user.updated message, got %d", userUpdatedCount)
-	}
-}
-
-// TestRedisQueue_messageProcessing tests message claiming and processing
-func TestRedisQueue_messageProcessing(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
-	defer cleanup()
-
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Store some messages
-	queuer.Store("task.process", "Task 1")
-	queuer.Store("task.process", "Task 2")
-	queuer.Store("task.process", "Task 3")
-
-	if queuer.Len() != 3 {
-		t.Errorf("Expected initial queue length 3, got %d", queuer.Len())
-	}
-
-	// Process messages by claiming them
-	processedCount := 0
-	queuer.RangeUnclaimedMessages(func(messageID, key string, value any) bool {
-		// Try to claim the message
-		if queuer.ClaimMessage(messageID) {
-			t.Logf("Claimed and processing: %s = %v", key, value)
-
-			// Mark as processed when done
-			queuer.MarkAsProcessed(messageID)
-			processedCount++
-
-			// Check if it's marked as processed
-			if !queuer.IsProcessed(messageID) {
-				t.Errorf("Message %s should be marked as processed", messageID)
+			// Run setup if provided
+			if tt.setup != nil {
+				tt.setup(t, redisClient)
 			}
-		}
-		return true // continue iteration
-	})
 
-	if processedCount != 3 {
-		t.Errorf("Expected to process 3 messages, got %d", processedCount)
-	}
+			// Create Redis queue instance
+			redisQueue := NewRedis(redisClient)
 
-	if queuer.Len() != 0 {
-		t.Errorf("Expected final queue length 0, got %d", queuer.Len())
-	}
-}
+			// Execute SetQueue
+			err := redisQueue.SetQueue(tt.ctx, tt.eventName)
 
-// TestRedisQueue_concurrency tests concurrent message processing
-func TestRedisQueue_concurrency(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
-	defer cleanup()
+			// Verify error expectation
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("SetQueue() error = nil, wantErr %v", tt.wantErr)
+					return
+				}
+			} else {
+				if err != nil {
+					t.Errorf("SetQueue() error = %v, wantErr %v", err, tt.wantErr)
+					return
+				}
+			}
 
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Store multiple messages
-	for i := 1; i <= 10; i++ {
-		queuer.Store("work.item", map[string]any{
-			"id":   i,
-			"task": "Work item " + string(rune(i)),
+			// Run verification if provided and no error was expected
+			if !tt.wantErr && tt.verify != nil {
+				tt.verify(t, redisClient, tt.eventName)
+			}
 		})
 	}
-
-	if queuer.Len() != 10 {
-		t.Errorf("Expected total messages 10, got %d", queuer.Len())
-	}
-
-	// Process with max concurrency of 3
-	batch := queuer.GetByMaxConcurrency(3)
-
-	if batch.Len() != 3 {
-		t.Errorf("Expected batch size 3, got %d", batch.Len())
-	}
-
-	// Original queue should have 7 remaining (3 were claimed)
-	if queuer.Len() != 7 {
-		t.Errorf("Expected remaining in original queue 7, got %d", queuer.Len())
-	}
-
-	// Process the batch
-	processedCount := 0
-	batch.RangeUnclaimedMessages(func(messageID, key string, value any) bool {
-		t.Logf("Processing: %s = %v", key, value)
-		batch.MarkAsProcessed(messageID)
-		processedCount++
-		return true
-	})
-
-	if batch.Len() != 0 {
-		t.Errorf("Expected batch length 0 after processing, got %d", batch.Len())
-	}
-
-	if processedCount != 3 {
-		t.Errorf("Expected to process 3 messages, got %d", processedCount)
-	}
 }
 
-// TestRedisQueue_keyFiltering tests working with specific message keys
-func TestRedisQueue_keyFiltering(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
+func TestSaveEventMsg(t *testing.T) {
+	redisClient, cleanup := setupRedisContainer(t)
+	if redisClient == nil {
+		panic("redis client is nil")
+	}
+
 	defer cleanup()
-
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Store messages with different keys
-	queuer.Store("email.send", map[string]any{"to": "user1@example.com", "subject": "Welcome"})
-	queuer.Store("email.send", map[string]any{"to": "user2@example.com", "subject": "Newsletter"})
-	queuer.Store("sms.send", map[string]any{"to": "+1234567890", "message": "Hello"})
-	queuer.Store("email.send", map[string]any{"to": "user3@example.com", "subject": "Update"})
-
-	if queuer.Len() != 4 {
-		t.Errorf("Expected total messages 4, got %d", queuer.Len())
-	}
-
-	// Get all email messages
-	emailMessages := queuer.GetUnclaimedMessagesByKey("email.send")
-	if len(emailMessages) != 3 {
-		t.Errorf("Expected email messages count 3, got %d", len(emailMessages))
-	}
-
-	// Process only email messages
-	processedEmails := 0
-	for _, msg := range emailMessages {
-		if queuer.ClaimMessage(msg.ID) {
-			t.Logf("Processing email: %v", msg.Value)
-			queuer.MarkAsProcessed(msg.ID)
-			processedEmails++
-		}
-	}
-
-	if processedEmails != 3 {
-		t.Errorf("Expected to process 3 emails, got %d", processedEmails)
-	}
-
-	if queuer.Len() != 1 {
-		t.Errorf("Expected remaining messages 1, got %d", queuer.Len())
-	}
-
-	// Delete all SMS messages
-	queuer.Delete("sms.send")
-	if queuer.Len() != 0 {
-		t.Errorf("Expected 0 messages after deleting SMS, got %d", queuer.Len())
-	}
-}
-
-// TestRedisQueue_claimRace tests claiming race conditions
-func TestRedisQueue_claimRace(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
-	defer cleanup()
-
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Store a message
-	queuer.Store("test.claim", "test value")
-
-	var messageID string
-	queuer.RangeUnclaimedMessages(func(id, key string, value any) bool {
-		messageID = id
-		return false // stop iteration
-	})
-
-	// First claim should succeed
-	if !queuer.ClaimMessage(messageID) {
-		t.Error("First claim should succeed")
-	}
-
-	// Second claim should fail
-	if queuer.ClaimMessage(messageID) {
-		t.Error("Second claim should fail")
-	}
-
-	// Message should not be available for Load
-	if _, found := queuer.Load("test.claim"); found {
-		t.Error("Claimed message should not be available for Load")
-	}
-}
-
-// TestRedisQueue_persistence tests that data persists across Redis queue instances
-func TestRedisQueue_persistence(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
-	defer cleanup()
-
-	// Create first queue instance and store data
-	{
-		redisQueue1 := queue.NewRedis(client)
-		redisQueue1.Store("persist.test", "persistent value")
-
-		if redisQueue1.Len() != 1 {
-			t.Errorf("Expected queue length 1, got %d", redisQueue1.Len())
-		}
-	}
-
-	// Create second queue instance and verify data is still there
-	{
-		redisQueue2 := queue.NewRedis(client)
-
-		if redisQueue2.Len() != 1 {
-			t.Errorf("Expected queue length 1 after reconnect, got %d", redisQueue2.Len())
-		}
-
-		if value, found := redisQueue2.Load("persist.test"); !found {
-			t.Error("Expected to find persistent message")
-		} else if value != "persistent value" {
-			t.Errorf("Expected 'persistent value', got %v", value)
-		}
-	}
-}
-
-// TestRedisQueue_deleteNonExistent tests deleting non-existent keys
-func TestRedisQueue_deleteNonExistent(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
-	defer cleanup()
-
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Store some messages
-	queuer.Store("existing.key", "value")
-
-	// Delete non-existent key (should not panic)
-	queuer.Delete("non.existent.key")
-
-	// Original message should still be there
-	if queuer.Len() != 1 {
-		t.Errorf("Expected queue length 1, got %d", queuer.Len())
-	}
-}
-
-// TestRedisQueue_emptyOperations tests operations on empty queue
-func TestRedisQueue_emptyOperations(t *testing.T) {
-	client, cleanup := setupRedisTest(t)
-	defer cleanup()
-
-	redisQueue := queue.NewRedis(client)
-	var queuer queue.Queuer = redisQueue
-
-	// Test empty queue operations
-	if queuer.Len() != 0 {
-		t.Errorf("Expected empty queue length 0, got %d", queuer.Len())
-	}
-
-	if value, found := queuer.Load("nonexistent"); found {
-		t.Errorf("Expected not to find value, got %v", value)
-	}
-
-	if queuer.ClaimMessage("nonexistent-id") {
-		t.Error("Expected claim to fail for nonexistent message")
-	}
-
-	if queuer.IsProcessed("nonexistent-id") {
-		t.Error("Expected IsProcessed to return false for nonexistent message")
-	}
-
-	messages := queuer.GetUnclaimedMessagesByKey("nonexistent")
-	if len(messages) != 0 {
-		t.Errorf("Expected no messages, got %d", len(messages))
-	}
-
-	batch := queuer.GetByMaxConcurrency(5)
-	if batch.Len() != 0 {
-		t.Errorf("Expected empty batch, got length %d", batch.Len())
-	}
-
-	// Range operations should not call function
-	queuer.Range(func(key string, value any) bool {
-		t.Error("Range function should not be called on empty queue")
-		return false
-	})
-
-	queuer.RangeUnclaimedMessages(func(messageID, key string, value any) bool {
-		t.Error("RangeUnclaimedMessages function should not be called on empty queue")
-		return false
-	})
-}
-
-// BenchmarkRedisQueue_Store benchmarks the Redis Store operation
-func BenchmarkRedisQueue_Store(b *testing.B) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       15,
-	})
-	defer client.Close()
 
 	ctx := context.Background()
-	if _, err := client.Ping(ctx).Result(); err != nil {
-		b.Skipf("Redis not available: %v", err)
+	assert.NoError(t, redisClient.Ping(ctx).Err())
+
+	tests := []struct {
+		name      string
+		eventName string
+		payload   map[string]any
+		isUnique  bool
+	}{
+		{
+			name:      uuid.New().String(),
+			eventName: "eventName.test_event",
+			payload:   map[string]any{"key": "value"},
+		},
+		{
+			name:      uuid.New().String(),
+			eventName: "eventName.test_event",
+			payload:   map[string]any{"key": "value"},
+			isUnique:  true,
+		},
 	}
 
-	client.FlushDB(ctx)
-	redisQueue := queue.NewRedis(client)
+	redisQueue := NewRedis(redisClient)
+	key := "gqueue:queue:messages:eventName.test_event"
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		redisQueue.Store("benchmark", i)
+	for _, tc := range tests {
+		redisClient.FlushDB(ctx)
+		if tc.isUnique {
+			assert.NoError(t, redisQueue.SaveEventMsg(ctx, tc.eventName, tc.payload, ActiveStatus, tc.isUnique))
+			assert.NoError(t, redisQueue.SaveEventMsg(ctx, tc.eventName, tc.payload, ActiveStatus, tc.isUnique))
+			assert.Equal(t, int64(1), redisClient.ZCard(ctx, key).Val())
+		} else {
+			assert.NoError(t, redisQueue.SaveEventMsg(ctx, tc.eventName, tc.payload, ActiveStatus, tc.isUnique))
+			assert.NoError(t, redisQueue.SaveEventMsg(ctx, tc.eventName, tc.payload, ActiveStatus, tc.isUnique))
+			assert.Equal(t, int64(2), redisClient.ZCard(ctx, key).Val())
+		}
+
+	}
+
+}
+
+func TestGetMsgsOnQueue(t *testing.T) {
+	redisClient, cleanup := setupRedisContainer(t)
+	if redisClient == nil {
+		panic("redis client is nil")
+	}
+
+	defer cleanup()
+
+	ctx := context.Background()
+	redisClient.FlushDB(ctx)
+
+	redisQueue := NewRedis(redisClient)
+
+	seedData(ctx, redisQueue)
+
+	eventsName, err := redisQueue.GetQueues(ctx)
+	assert.NoError(t, err)
+	expected := []string{"eventName1.test_event", "eventName2.test_event", "eventName3.test_event"}
+	assert.ElementsMatch(t, expected, eventsName)
+
+	for _, eventName := range expected {
+		msgs, err := redisQueue.GetMsgsByQueue(ctx, eventName, ActiveStatus, 0, DefaultMaxMsg)
+		assert.NoError(t, err)
+
+		switch eventName {
+		case "eventName1.test_event":
+			assert.Equal(t, 2, len(msgs), "Expected 2 messages for eventName1.test_event")
+		case "eventName2.test_event":
+			assert.Equal(t, 2, len(msgs), "Expected 2 messages for eventName2.test_event")
+		case "eventName3.test_event":
+			assert.Equal(t, 1, len(msgs), "Expected 1 message for eventName3.test_event")
+		}
 	}
 }
 
-// BenchmarkRedisQueue_Load benchmarks the Redis Load operation
-func BenchmarkRedisQueue_Load(b *testing.B) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       15,
+func TestGetMsgsWithConcurrency(t *testing.T) {
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
 	})
-	defer client.Close()
 
 	ctx := context.Background()
-	if _, err := client.Ping(ctx).Result(); err != nil {
-		b.Skipf("Redis not available: %v", err)
+	redisQueue := NewRedis(redisClient)
+	seedData(ctx, redisQueue)
+	defer redisClient.FlushAll(ctx)
+
+	eventsNames, err := redisQueue.GetQueues(ctx)
+	assert.NoError(t, err)
+
+	var expectedMsgs []Msg
+	for _, eventName := range eventsNames {
+		msgs, err := redisQueue.GetMsgsByQueue(ctx, eventName, ActiveStatus, 0, DefaultMaxMsg)
+		assert.NoError(t, err)
+
+		for _, msg := range msgs {
+			msg.Status = ProcessingStatus
+			expectedMsgs = append(expectedMsgs, msg)
+		}
 	}
 
-	client.FlushDB(ctx)
-	redisQueue := queue.NewRedis(client)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Pre-populate with some data
-	for i := 0; i < 1000; i++ {
-		redisQueue.Store("benchmark", i)
-	}
+	var result1 []Msg
+	var result2 []Msg
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		redisQueue.Load("benchmark")
+	// CH1
+	go func() {
+		defer wg.Done()
+		counter := 0
+		for _, eventName := range eventsNames {
+			msgs, err := redisQueue.GetMsgsToProcess(ctx, eventName, DefaultMaxMsg)
+			assert.NoError(t, err)
+			if len(msgs) == 0 {
+				continue
+			}
+			result1 = append(result1, msgs...)
+			counter++
+		}
+	}()
+
+	// CH2
+	go func() {
+		defer wg.Done()
+		counter := 0
+		for _, eventName := range eventsNames {
+			msgs, err := redisQueue.GetMsgsToProcess(ctx, eventName, DefaultMaxMsg)
+			assert.NoError(t, err)
+			if len(msgs) == 0 {
+				continue
+			}
+			result2 = append(result2, msgs...)
+			counter++
+		}
+	}()
+
+	wg.Wait()
+	var result []Msg
+	result = append(result1, result2...)
+
+	// assert.ElementsMatch(t, result, expectedMsgs)
+	assert.Equal(t, len(result), len(expectedMsgs))
+	assert.ElementsMatch(t, result, expectedMsgs)
+
+}
+
+func TestCreateSeed(t *testing.T) {
+	redisClient, cleanup := setupRedisContainer(t)
+	if redisClient == nil {
+		t.Skip("Redis client is nil")
 	}
+	defer cleanup()
+
+	ctx := context.Background()
+	redisQueue := NewRedis(redisClient)
+	seedData(ctx, redisQueue)
+}
+
+func seedData(ctx context.Context, redisQueue *Redis) {
+	redisQueue.SaveEventMsg(ctx, "eventName1.test_event", map[string]any{"key": "value1"}, ActiveStatus, false)
+	redisQueue.SaveEventMsg(ctx, "eventName1.test_event", map[string]any{"key": "value2"}, ActiveStatus, false)
+	redisQueue.SaveEventMsg(ctx, "eventName2.test_event", map[string]any{"key": "value3"}, ActiveStatus, false)
+	redisQueue.SaveEventMsg(ctx, "eventName2.test_event", map[string]any{"key": "value4"}, ActiveStatus, false)
+	redisQueue.SaveEventMsg(ctx, "eventName3.test_event", map[string]any{"key": "value5"}, ActiveStatus, false)
 }

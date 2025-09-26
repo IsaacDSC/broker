@@ -32,9 +32,6 @@ func NewSubscribe(conn *broker.Client) *Subscribe {
 		stopCh:      make(chan struct{}),
 	}
 
-	// Registra este subscriber no balancer
-	conn.Balancer.Subscribe(sub.subID)
-
 	return sub
 }
 
@@ -63,6 +60,21 @@ func (b *Subscribe) WithSubscriber(eventName string, handler SubscriberHandler) 
 	return b
 }
 
+func (b *Subscribe) Listener() error {
+	if b.subscribers == nil {
+		return errors.New("subscribers map is nil")
+	}
+
+	if len(b.subscribers) == 0 {
+		return errors.New("no subscribers")
+	}
+
+	for {
+		//criar fila por event_name
+		// b.Queue.
+	}
+}
+
 func (b *Subscribe) processMessage(messageID, eventName string, msg any) {
 	defer func() {
 		<-b.semaphore // libera o slot do semáforo
@@ -82,90 +94,4 @@ func (b *Subscribe) processMessage(messageID, eventName string, msg any) {
 	if err := subscriber.Handler(Ctx{ctx, msg}); err != nil {
 		log.Println("[*] Error handling event: ", eventName, err)
 	}
-}
-
-func (b *Subscribe) Listener() error {
-	if b.subscribers == nil {
-		return errors.New("subscribers map is nil")
-	}
-
-	if len(b.subscribers) == 0 {
-		return errors.New("no subscribers")
-	}
-
-	for {
-		select {
-		case <-b.stopCh:
-			// Desregistra do balancer antes de parar
-			b.Balancer.Unsubscribe(b.subID)
-			// Aguarda todas as goroutines terminarem antes de parar
-			b.processingWg.Wait()
-			return nil
-		default:
-			// Processa mensagens da fila usando o novo sistema
-			b.processAvailableMessages()
-		}
-	}
-}
-
-func (b *Subscribe) processAvailableMessages() {
-	// Para cada tipo de evento que este subscriber está inscrito
-	for eventKey := range b.subscribers {
-		// Extrai o nome do evento da chave
-		eventName := b.extractEventName(eventKey)
-
-		// Busca mensagens não reivindicadas para este evento
-		messages := b.Queue.GetUnclaimedMessagesByKey(eventName)
-
-		for _, msg := range messages {
-			// Verifica se este subscriber deve processar esta mensagem
-			if !b.Balancer.ClaimMessage(b.subID, msg.ID) {
-				continue
-			}
-
-			// Verifica se a mensagem já foi processada
-			if b.Queue.IsProcessed(msg.ID) {
-				continue
-			}
-
-			// Tenta reivindicar a mensagem atomicamente
-			if !b.Queue.ClaimMessage(msg.ID) {
-				continue
-			}
-
-			select {
-			case b.semaphore <- struct{}{}: // tenta adquirir slot do semáforo
-				b.processingWg.Add(1)
-				go b.processMessage(msg.ID, eventName, msg.Value)
-			default:
-				// Se não conseguir adquirir o semáforo, libera a reivindicação
-				// e tenta novamente no próximo ciclo
-				continue
-			}
-		}
-	}
-}
-
-// Extrai o nome do evento da chave do broker
-func (b *Subscribe) extractEventName(eventKey string) string {
-	// Remove o prefixo do broker (formato: "gqueue:app-name:event")
-	parts := []rune(eventKey)
-	lastColon := -1
-
-	for i := len(parts) - 1; i >= 0; i-- {
-		if parts[i] == ':' {
-			lastColon = i
-			break
-		}
-	}
-
-	if lastColon != -1 && lastColon < len(parts)-1 {
-		return string(parts[lastColon+1:])
-	}
-
-	return eventKey
-}
-
-func (b *Subscribe) Stop() {
-	close(b.stopCh)
 }

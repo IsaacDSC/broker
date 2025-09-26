@@ -24,3 +24,17 @@ The Redis queue uses the following Redis data structures:
 - `queue:claimed` (Set): Contains message IDs that have been claimed for processing
 - `queue:processed` (Set): Contains message IDs that have been processed
 - `queue:keys:{key}` (Set): Contains message IDs grouped by message key
+
+### LER TIPO SORTED SET gqueue:queue:messages:eventName.test_event
+
+**Buscando o total de itens**
+
+```sh
+ZCARD gqueue:queue:messages:eventName.test_event
+```
+
+**Buscando os itens**
+
+```sh
+ZRANGE gqueue:queue:messages:eventName.test_event 0 -1 WITHSCORES
+```
