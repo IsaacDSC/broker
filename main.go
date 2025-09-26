@@ -11,12 +11,13 @@ import (
 )
 
 func main() {
-	client := broker.NewClient(broker.Config{
-		Addr:    "localhost:6379",
-		AppName: "app-name",
-	})
-	go SetupConsumer("instance1", client)
-	go SetupConsumer("instance2", client)
+	// client := broker.NewClient(broker.Config{
+	// 	Addr:    "localhost:6379",
+	// 	AppName: "app-name",
+	// })
+	client := broker.NewRdbClient(*broker.DefaultRedisConfig("app-name"))
+	go SetupConsumer("🔵instance1", client)
+	go SetupConsumer("🟢instance2", client)
 	SetupProducer(client)
 }
 

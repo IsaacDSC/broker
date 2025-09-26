@@ -3,17 +3,16 @@ package broker
 import (
 	"fmt"
 
-	"github.com/IsaacDSC/broker/load"
 	"github.com/IsaacDSC/broker/queue"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 type Client struct {
 	ID      uuid.UUID
 	appName string
 
-	Queue    *queue.QueueBase
-	Balancer *load.Balancer
+	Queue queue.Queuer
 }
 
 type Config struct {
@@ -21,12 +20,17 @@ type Config struct {
 	AppName string
 }
 
-func NewClient(cfg Config) *Client {
+func NewClient(cfg RedisConfig) *Client {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.Addr,
+		Password: cfg.Password,
+		DB:       cfg.DB,
+	})
+
 	client := &Client{
-		ID:       uuid.New(),
-		appName:  cfg.AppName,
-		Queue:    queue.NewQueueBase(),
-		Balancer: load.NewBalancer(cfg.AppName),
+		ID:      uuid.New(),
+		appName: cfg.AppName,
+		Queue:   queue.NewRedis(rdb),
 	}
 	return client
 }
