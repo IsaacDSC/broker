@@ -19,6 +19,8 @@ func main() {
 
 	client := broker.NewClient(*broker.DefaultRedisConfig("app-name"))
 
+	defer client.Close()
+
 	const instancePrefix = "instance-%s"
 	mapper := map[string]string{"1": "🟢", "2": "🔵", "3": "🔴"}
 

@@ -12,6 +12,8 @@ import (
 
 func main() {
 	broker := broker.NewClient(*broker.DefaultRedisConfig("app-name"))
+	defer broker.Close()
+
 	ctx := context.Background()
 
 	fmt.Println("\n📤 Starting message production...")
