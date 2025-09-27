@@ -57,6 +57,8 @@ func (r *Redis) SaveEventMsg(ctx context.Context, eventName string, msg any, sta
 		Score:  score,
 		Member: msgInBytes,
 	})
+	// Set TTL using maxRetention
+	pipe.Expire(ctx, key, r.maxRetention)
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to save event message: %w", err)
@@ -89,6 +91,14 @@ func (r *Redis) DeleteMsgsByQueue(ctx context.Context, eventName string, status 
 
 	if _, err := r.client.ZRemRangeByScore(ctx, key, fmt.Sprintf("%d", start), fmt.Sprintf("%d", end)).Result(); err != nil {
 		return fmt.Errorf("failed to delete messages by queue: %w", err)
+	}
+
+	return nil
+}
+
+func (r *Redis) Close() error {
+	if err := r.client.Close(); err != nil {
+		return fmt.Errorf("failed to close redis client: %v", err)
 	}
 
 	return nil

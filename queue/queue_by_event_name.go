@@ -11,6 +11,8 @@ func (r *Redis) SetQueue(ctx context.Context, eventName string) error {
 	key := strings.Join([]string{prefix, queuePrefix}, separator)
 	pipe := r.client.Pipeline()
 	pipe.SAdd(ctx, key, eventName)
+	// Set TTL using maxRetention
+	pipe.Expire(ctx, key, r.maxRetention)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to set queue: %w", err)
 	}

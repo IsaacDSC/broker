@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 type Redis struct {
-	client *redis.Client
-	ctx    context.Context
+	client       *redis.Client
+	ctx          context.Context
+	maxRetention time.Duration
 }
 
 const (
@@ -23,8 +25,9 @@ const (
 
 func NewRedis(client *redis.Client) *Redis {
 	return &Redis{
-		client: client,
-		ctx:    context.Background(),
+		client:       client,
+		ctx:          context.Background(),
+		maxRetention: time.Hour * (24 * 7),
 	}
 }
 
@@ -83,6 +86,11 @@ func (r *Redis) GetMsgsToProcess(ctx context.Context, eventName string, maxMsg i
 			return nil, fmt.Errorf("failed to add message to processing queue: %w", err)
 		}
 
+		// Set TTL using maxRetention
+		if err := r.client.Expire(ctx, processingKey, r.maxRetention).Err(); err != nil {
+			return nil, fmt.Errorf("failed to set TTL on processing queue: %w", err)
+		}
+
 		msgs = append(msgs, msg)
 	}
 
@@ -133,6 +141,11 @@ func (r *Redis) ChangeStatus(ctx context.Context, eventName string, fromstatus, 
 			Member: msgBytes,
 		}).Err(); err != nil {
 			return fmt.Errorf("failed to add message to target queue: %w", err)
+		}
+
+		// Set TTL using maxRetention
+		if err := r.client.Expire(ctx, targetKey, r.maxRetention).Err(); err != nil {
+			return fmt.Errorf("failed to set TTL on target queue: %w", err)
 		}
 
 		membersToRemove = append(membersToRemove, msgStr)

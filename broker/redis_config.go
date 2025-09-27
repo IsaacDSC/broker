@@ -141,24 +141,6 @@ func (c *RedisClusterConfig) NewRedisClusterClient() *redis.ClusterClient {
 	})
 }
 
-// NewRedisClusterQueue creates a new Redis queue with Redis Cluster
-func (c *RedisClusterConfig) NewRedisClusterQueue() (*queue.Redis, error) {
-	client := c.NewRedisClusterClient()
-
-	// Test connection
-	ctx, cancel := context.WithTimeout(context.Background(), c.DialTimeout)
-	defer cancel()
-
-	_, err := client.Ping(ctx).Result()
-	if err != nil {
-		client.Close()
-		return nil, err
-	}
-
-	// Redis Cluster client can be used as a regular redis.Cmdable interface
-	return queue.NewRedis(client), nil
-}
-
 // TestRedisClusterConnection tests if Redis Cluster is available with the given configuration
 func (c *RedisClusterConfig) TestRedisClusterConnection() error {
 	client := c.NewRedisClusterClient()

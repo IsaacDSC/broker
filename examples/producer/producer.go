@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -10,33 +11,35 @@ import (
 )
 
 func main() {
-	broker := broker.NewRdbClient(*broker.DefaultRedisConfig("app-name"))
-	// broker := pub.NewBroker(client)
+	broker := broker.NewClient(*broker.DefaultRedisConfig("app-name"))
+	ctx := context.Background()
 
 	fmt.Println("\n📤 Starting message production...")
 
 	for i := range 10 {
 		// Event 1
-		err := broker.Publish("event1", map[string]any{
+		err := broker.Publish(ctx, "event1", map[string]any{
 			"id":        uuid.New(),
 			"user":      "isaac",
 			"iteration": i,
 		})
+
 		if err != nil {
 			log.Printf("Error publishing event1: %v", err)
 		}
 
-		err = broker.Publish("event1", map[string]any{
+		err = broker.Publish(ctx, "event1", map[string]any{
 			"id":        uuid.New(),
 			"user":      "isaacdsc",
 			"iteration": i,
 		})
+
 		if err != nil {
 			log.Printf("Error publishing event1: %v", err)
 		}
 
 		// Event 2
-		err = broker.Publish("event2", map[string]any{
+		err = broker.Publish(ctx, "event2", map[string]any{
 			"id":        uuid.New(),
 			"user":      "raissa",
 			"iteration": i,
@@ -46,11 +49,12 @@ func main() {
 		}
 
 		// Event 3 (não tem subscriber - deve mostrar log)
-		err = broker.Publish("event3", map[string]any{
+		err = broker.Publish(ctx, "event3", map[string]any{
 			"id":        uuid.New(),
 			"user":      "raquel",
 			"iteration": i,
 		})
+
 		if err != nil {
 			log.Printf("Error publishing event3: %v", err)
 		}

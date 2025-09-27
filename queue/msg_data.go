@@ -15,7 +15,7 @@ const (
 	ActiveStatus     MsgQueueStatus = "ACTIVE"
 	ProcessingStatus MsgQueueStatus = "PROCESSING"
 	AckedStatus      MsgQueueStatus = "ACKED"
-	FailedStatus     MsgQueueStatus = "FAILED"
+	NackedStatus     MsgQueueStatus = "FAILED"
 	ArchivedStatus   MsgQueueStatus = "ARCHIVED"
 )
 

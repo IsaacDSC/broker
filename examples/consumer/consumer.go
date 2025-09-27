@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/IsaacDSC/broker/broker"
-	"github.com/IsaacDSC/broker/sub"
 )
 
 func main() {
@@ -18,31 +17,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := broker.NewRdbClient(*broker.DefaultRedisConfig("app-name"))
+	client := broker.NewClient(*broker.DefaultRedisConfig("app-name"))
 
 	const instancePrefix = "instance-%s"
 	mapper := map[string]string{"1": "🟢", "2": "🔵", "3": "🔴"}
 
-	subscriber := sub.NewSubscribe(client).
-		WithSubscriber(
-			"event1", func(subctx sub.Ctx) error {
+	subscriber := client.
+		Subscribe(
+			"event1", func(subctx broker.Ctx) error {
 				payload := subctx.GetPayload()
 				prefix := fmt.Sprintf(instancePrefix, args[1])
 				fmt.Printf("%s %s Handling event1: %v\n", mapper[args[1]], prefix, payload)
 
 				// Simula processamento
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(1000 * time.Millisecond)
 				return nil
 			},
 		).
-		WithSubscriber(
-			"event2", func(subctx sub.Ctx) error {
+		Subscribe(
+			"event2", func(subctx broker.Ctx) error {
 				payload := subctx.GetPayload()
 				prefix := fmt.Sprintf(instancePrefix, args[1])
 				fmt.Printf("%s %s Handling event2: %v\n", mapper[args[1]], prefix, payload)
 
 				// Simula processamento
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(1000 * time.Millisecond)
 				return nil
 			},
 		)
