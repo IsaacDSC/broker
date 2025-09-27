@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -500,7 +501,6 @@ func TestGetMsgsWithConcurrency(t *testing.T) {
 	var result []Msg
 	result = append(result1, result2...)
 
-	// assert.ElementsMatch(t, result, expectedMsgs)
 	assert.Equal(t, len(result), len(expectedMsgs))
 	assert.ElementsMatch(t, result, expectedMsgs)
 
@@ -524,4 +524,52 @@ func seedData(ctx context.Context, redisQueue *Redis) {
 	redisQueue.SaveEventMsg(ctx, "eventName2.test_event", map[string]any{"key": "value3"}, ActiveStatus, false)
 	redisQueue.SaveEventMsg(ctx, "eventName2.test_event", map[string]any{"key": "value4"}, ActiveStatus, false)
 	redisQueue.SaveEventMsg(ctx, "eventName3.test_event", map[string]any{"key": "value5"}, ActiveStatus, false)
+}
+
+func TestChangeStatus(t *testing.T) {
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	ctx := context.Background()
+	redisQueue := NewRedis(redisClient)
+	defer redisClient.FlushAll(ctx)
+
+	fromStatus := ProcessingStatus
+	toStatus := AckedStatus
+
+	expectedMsg := map[string]any{"key": "value1"}
+	timeNow := time.Now().UTC()
+	msgData := Msg{
+		ID:     uuid.New().String(),
+		Value:  expectedMsg,
+		Status: ProcessingStatus,
+		Time:   timeNow,
+	}
+
+	b, _ := json.Marshal(msgData)
+	eventName := fmt.Sprintf("eventName1.test_event.%s", time.Now().Format("20060102150405"))
+	key := redisQueue.createEventKey(eventName, fromStatus)
+	redisClient.ZAdd(ctx, key, redis.Z{
+		Score:  float64(timeNow.UnixMicro()),
+		Member: b,
+	})
+
+	assert.NoError(t, redisQueue.ChangeStatus(ctx, eventName, fromStatus, toStatus, timeNow.UnixMicro(), timeNow.UnixMicro()))
+
+	processingMsgs, err := redisClient.ZRange(ctx, key, 0, -1).Result()
+	assert.NoError(t, err)
+	assert.Len(t, processingMsgs, 0)
+
+	ackedKey := redisQueue.createEventKey(eventName, toStatus)
+	ackedMsgs, err := redisClient.ZRange(ctx, ackedKey, 0, -1).Result()
+	assert.NoError(t, err)
+	assert.Len(t, ackedMsgs, 1)
+
+	var msg Msg
+	err = json.Unmarshal([]byte(ackedMsgs[0]), &msg)
+	assert.NoError(t, err)
+	assert.Equal(t, toStatus, msg.Status)
+	assert.Equal(t, expectedMsg, msg.Value)
+
 }

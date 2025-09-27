@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/redis/go-redis/v9"
@@ -88,10 +89,61 @@ func (r *Redis) GetMsgsToProcess(ctx context.Context, eventName string, maxMsg i
 	return msgs, nil
 }
 
-// ZRANGEBYSCORE gqueue:queue:messages:eventName1.test_event:PROCESSING 1758844247677371 1758844247677371 WITHSCORES
-func (r *Redis) ChangeStatus(ctx context.Context, eventName string, status MsgQueueStatus, scores ...int64) error {
-	r.client.ZRangeWithScores(ctx, r.createEventKey(eventName, status), scores[0], scores[1]).Result()
-	// DELETAR
-	// SALVAR COM STATUS OK | ERROR
+var ErrNoMessagesFound = errors.New("no messages found")
+
+// REDIS-CLI command to ZRANGEBYSCORE gqueue:queue:messages:eventName1.test_event:PROCESSING 1758844247677371 1758844247677371 WITHSCORES
+func (r *Redis) ChangeStatus(ctx context.Context, eventName string, fromstatus, tostatus MsgQueueStatus, scores ...int64) error {
+	start := scores[0]
+	end := scores[len(scores)-1]
+
+	sourceKey := r.createEventKey(eventName, fromstatus)
+	results, err := r.client.ZRangeByScoreWithScores(ctx, sourceKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", start),
+		Max: fmt.Sprintf("%d", end),
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get messages from event queue: %w", err)
+	}
+
+	if len(results) == 0 {
+		return ErrNoMessagesFound
+	}
+
+	var membersToRemove []any
+	targetKey := r.createEventKey(eventName, tostatus)
+
+	for _, item := range results {
+		msgStr := item.Member.(string)
+		score := item.Score
+
+		var msg Msg
+		if err := json.Unmarshal([]byte(msgStr), &msg); err != nil {
+			return fmt.Errorf("failed to unmarshal message: %w", err)
+		} else {
+			msg.Status = tostatus
+		}
+
+		msgBytes, err := json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal message: %w", err)
+		}
+
+		if err := r.client.ZAdd(ctx, targetKey, redis.Z{
+			Score:  score,
+			Member: msgBytes,
+		}).Err(); err != nil {
+			return fmt.Errorf("failed to add message to target queue: %w", err)
+		}
+
+		membersToRemove = append(membersToRemove, msgStr)
+	}
+
+	// DELETE FROM SOURCE QUEUE
+	if len(membersToRemove) > 0 {
+		if err := r.client.ZRem(ctx, sourceKey, membersToRemove...).Err(); err != nil {
+			return fmt.Errorf("failed to remove messages from source queue: %w", err)
+		}
+	}
+
 	return nil
 }
